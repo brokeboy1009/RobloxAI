@@ -1,0 +1,5 @@
+{
+  "name": "npc-proxy",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "express": "^4.19.2" }
+                  }
