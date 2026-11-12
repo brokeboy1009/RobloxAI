@@ -1,9 +1,348 @@
 "use strict";
 
-const express = require("express");
-const rateLimit = require("express-rate-limit");
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 
-const {
+function redactSecrets(value) {
+  if (typeof value === "string") {
+    return value
+      .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [REDACTED]")
+      .replace(/\bgsk_[A-Za-z0-9_-]+/g, "[REDACTED]")
+      .replace(/(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*["']?[^"' \n,}]+/gi, "$1=[REDACTED]");
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(redactSecrets);
+  }
+
+  if (value && typeof value === "object") {
+    const result = {};
+
+    for (const [key, item] of Object.entries(value)) {
+      if (/api[_-]?key|token|secret|password|authorization/i.test(key)) {
+        result[key] = "[REDACTED]";
+      } else {
+        result[key] = redactSecrets(item);
+      }
+    }
+
+    return result;
+  }
+
+  return value;
+}
+
+function moderateContent(input) {
+  const text = typeof input === "string"
+    ? input
+    : JSON.stringify(input || "");
+
+  const blockedPatterns = [
+    /steal.{0,30}(password|token|key|cookie|credential)/i,
+    /keylogger/i,
+    /ransomware/i,
+    /credential theft/i,
+    /ddos/i,
+    /steal.{0,30}(api|groq|render|roblox).{0,20}(key|token|secret)/i,
+    /hack.{0,30}(render|roblox|server).{0,20}(account|access|password)/i,
+    /bypass.{0,30}(authentication|login|security)/i
+  ];
+
+  return !blockedPatterns.some(pattern => pattern.test(text));
+}
+
+function toText(value, maxLength = 20000) {
+  if (typeof value === "string") {
+    return value.slice(0, maxLength);
+  }
+
+  try {
+    return JSON.stringify(value).slice(0, maxLength);
+  } catch {
+    return "";
+  }
+}
+
+function parseJson(text) {
+  if (typeof text !== "string") {
+    return text;
+  }
+
+  let cleaned = text.trim();
+
+  cleaned = cleaned
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/, "");
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+
+    if (start !== -1 && end > start) {
+      try {
+        return JSON.parse(cleaned.slice(start, end + 1));
+      } catch {}
+    }
+
+    throw new Error("The AI returned invalid JSON.");
+  }
+}
+
+async function callGroq(systemPrompt, userPrompt, options = {}) {
+  if (!GROQ_API_KEY) {
+    throw new Error("GROQ_API_KEY is missing from Render environment variables.");
+  }
+
+  const messages = [
+    {
+      role: "system",
+      content: systemPrompt
+    },
+    {
+      role: "user",
+      content: userPrompt
+    }
+  ];
+
+  const payload = {
+    model: GROQ_MODEL,
+    messages,
+    temperature: options.temperature ?? 0.4,
+    max_tokens: options.maxTokens ?? 6000
+  };
+
+  if (options.json) {
+    payload.response_format = {
+      type: "json_object"
+    };
+  }
+
+  const response = await fetch(GROQ_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + GROQ_API_KEY
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    console.error("Groq request failed:", response.status);
+
+    throw new Error("The AI service request failed.");
+  }
+
+  const content = data.choices?.[0]?.message?.content;
+
+  if (!content) {
+    throw new Error("The AI returned an empty response.");
+  }
+
+  return options.json ? parseJson(content) : content;
+}
+
+async function chat(input) {
+  const message = toText(input.message, 12000);
+
+  const history = Array.isArray(input.history)
+    ? input.history.slice(-20).map(item => ({
+        role: item.role === "assistant" ? "assistant" : "user",
+        content: toText(item.content || item.message, 4000)
+      }))
+    : [];
+
+  const systemPrompt = `
+You are RobloxAI, an assistant for creating Roblox games.
+
+Help users with Roblox Studio, Luau scripts, game mechanics,
+UI design, building ideas, debugging, and improving games.
+
+Give accurate, practical answers.
+Keep code compatible with Roblox Luau.
+Never reveal API keys, passwords, tokens, or private server data.
+Do not create exploit scripts, credential theft tools,
+or code designed to attack servers or accounts.
+`;
+
+  return callGroq(
+    systemPrompt,
+    "Context:\n" + toText(input.context, 10000) +
+    "\n\nConversation:\n" + JSON.stringify(history) +
+    "\n\nUser:\n" + message,
+    {
+      maxTokens: 5000
+    }
+  );
+               }async function generateCode(input) {
+  const systemPrompt = `
+You are RobloxAI's Roblox Luau code generator.
+
+Generate clean, functional Roblox Luau code.
+Use correct Roblox services and APIs.
+Explain which scripts belong in ServerScriptService,
+StarterPlayerScripts, StarterGui, or other locations.
+
+Never generate exploit scripts, account theft,
+credential theft, or server attack code.
+
+Return the requested code and its required placement.
+`;
+
+  return callGroq(
+    systemPrompt,
+    "Request:\n" + toText(input.prompt, 12000) +
+    "\n\nContext:\n" + toText(input.context, 10000) +
+    "\n\nWorkspace:\n" + toText(input.workspace, 10000),
+    {
+      maxTokens: 7000
+    }
+  );
+}
+
+async function buildMap(input) {
+  const systemPrompt = `
+You are RobloxAI's map-building planner.
+
+Convert the user's building request into structured JSON.
+Return valid JSON only.
+
+Use this structure:
+{
+  "success": true,
+  "description": "Short description",
+  "objects": [
+    {
+      "name": "PartName",
+      "type": "Part",
+      "position": [0, 0, 0],
+      "size": [4, 1, 4],
+      "color": [255, 255, 255],
+      "material": "SmoothPlastic",
+      "anchored": true
+    }
+  ]
+}
+
+Use reasonable Roblox dimensions.
+Do not include scripts that attack accounts or servers.
+`;
+
+  return callGroq(
+    systemPrompt,
+    "Build request:\n" + toText(input.prompt, 12000) +
+    "\n\nWorkspace:\n" + toText(input.workspace, 12000) +
+    "\n\nContext:\n" + toText(input.context, 8000),
+    {
+      json: true,
+      maxTokens: 7000
+    }
+  );
+}
+
+async function improveMap(input) {
+  const systemPrompt = `
+You are RobloxAI's map improvement assistant.
+
+Analyze the supplied Roblox workspace information.
+Suggest or generate improvements based on the user's request.
+Return valid JSON only.
+
+Use this structure:
+{
+  "success": true,
+  "description": "What changed",
+  "objects": [],
+  "remove": []
+}
+
+Never remove unrelated objects.
+Do not create destructive or malicious scripts.
+`;
+
+  return callGroq(
+    systemPrompt,
+    "Improvement request:\n" + toText(input.prompt, 12000) +
+    "\n\nWorkspace:\n" + toText(input.workspace, 15000) +
+    "\n\nContext:\n" + toText(input.context, 8000),
+    {
+      json: true,
+      maxTokens: 7000
+    }
+  );
+}
+
+async function generateIdeas(input) {
+  const systemPrompt = `
+You are RobloxAI's game idea generator.
+
+Generate creative Roblox game ideas.
+Include gameplay mechanics, objectives, features,
+and suggestions for building the game.
+
+Return valid JSON only.
+
+Use this structure:
+{
+  "ideas": [
+    {
+      "name": "Game name",
+      "description": "Game description",
+      "features": [],
+      "mechanics": []
+    }
+  ]
+}
+`;
+
+  return callGroq(
+    systemPrompt,
+    "Generate ideas for:\n" + toText(input.prompt, 5000) +
+    "\n\nContext:\n" + toText(input.context, 8000),
+    {
+      json: true,
+      maxTokens: 5000
+    }
+  );
+}
+
+async function reviewWorkspace(input) {
+  const systemPrompt = `
+You are RobloxAI's Roblox workspace reviewer.
+
+Review the supplied workspace information.
+Find possible problems, missing objects,
+organization issues, and improvement opportunities.
+
+Return valid JSON only.
+
+Use this structure:
+{
+  "success": true,
+  "summary": "Review summary",
+  "problems": [],
+  "suggestions": [],
+  "warnings": []
+}
+`;
+
+  return callGroq(
+    systemPrompt,
+    "Workspace:\n" + toText(input.workspace, 15000) +
+    "\n\nContext:\n" + toText(input.context, 8000),
+    {
+      json: true,
+      maxTokens: 5000
+    }
+  );
+}
+
+module.exports = {
   chat,
   generateCode,
   buildMap,
@@ -12,370 +351,4 @@ const {
   reviewWorkspace,
   moderateContent,
   redactSecrets
-} = require("./agents");
-
-const app = express();
-
-const PORT = process.env.PORT || 10000;
-const APP_TOKEN = process.env.APP_TOKEN || "";
-
-app.disable("x-powered-by");
-app.use(express.json({ limit: "1mb" }));
-
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
-
-  next();
-});
-
-app.use("/api", rateLimit({
-  windowMs: 60 * 1000,
-  limit: 30,
-  standardHeaders: "draft-7",
-  legacyHeaders: false,
-  message: {
-    error: "Too many requests. Please wait a moment."
-  }
-}));
-
-function clean(value, maxLength = 12000) {
-  if (typeof value !== "string") return "";
-  return value.trim().slice(0, maxLength);
-}
-
-function getBody(req) {
-  return req.body && typeof req.body === "object"
-    ? req.body
-    : {};
-}
-
-function checkAuth(req, res, next) {
-  if (!APP_TOKEN) return next();
-
-  const authorization = req.headers.authorization || "";
-  const suppliedToken = authorization.startsWith("Bearer ")
-    ? authorization.slice(7)
-    : "";
-
-  if (suppliedToken !== APP_TOKEN) {
-    return res.status(401).json({
-      error: "Unauthorized"
-    });
-  }
-
-  next();
-}
-
-function safeOutput(value) {
-  try {
-    const result = redactSecrets(value);
-    return result === undefined ? value : result;
-  } catch {
-    return value;
-  }
-}
-
-function moderate(input) {
-  try {
-    const result = moderateContent(input);
-
-    if (result === false) return false;
-
-    if (result && typeof result === "object") {
-      if (result.allowed === false || result.blocked === true) {
-        return false;
-      }
-    }
-
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function runAgent(agent, input) {
-  if (typeof agent !== "function") {
-    throw new Error("AI agent is not configured correctly.");
-  }
-
-  const result = await agent(input);
-
-  if (result === undefined || result === null) {
-    throw new Error("The AI returned an empty response.");
-  }
-
-  return safeOutput(result);
-}
-
-app.get("/", (req, res) => {
-  res.json({
-    service: "RobloxAI",
-    status: "online",
-    endpoints: [
-      "/health",
-      "/api/chat",
-      "/api/generate",
-      "/api/build",
-      "/api/improve",
-      "/api/undo",
-      "/api/ideas",
-      "/api/review"
-    ]
-  });
-});
-
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "roblox-ai-game-creator",
-    status: "online"
-  });
-});
-
-app.post("/api/chat", checkAuth, async (req, res) => {
-  try {
-    const body = getBody(req);
-    const message = clean(body.message, 12000);
-
-    if (!message) {
-      return res.status(400).json({
-        error: "Message is required."
-      });
-    }
-
-    if (!moderate(message)) {
-      return res.status(400).json({
-        error: "This request cannot be processed."
-      });
-    }
-
-    const history = Array.isArray(body.history)
-      ? body.history.slice(-20)
-      : [];
-
-    const result = await runAgent(chat, {
-      message,
-      history,
-      context: clean(body.context, 12000)
-    });
-
-    res.json({
-      success: true,
-      result
-    });
-  } catch (error) {
-    console.error("Chat error:", error.message);
-
-    res.status(500).json({
-      error: "Chat request failed."
-    });
-  }
-});
-
-app.post("/api/generate", checkAuth, async (req, res) => {
-  try {
-    const body = getBody(req);
-    const prompt = clean(body.prompt, 12000);
-
-    if (!prompt) {
-      return res.status(400).json({
-        error: "A generation prompt is required."
-      });
-    }
-
-    if (!moderate(prompt)) {
-      return res.status(400).json({
-        error: "This request cannot be processed."
-      });
-    }
-
-    const result = await runAgent(generateCode, {
-      prompt,
-      context: clean(body.context, 10000),
-      workspace: body.workspace || null
-    });
-
-    res.json({
-      success: true,
-      result
-    });
-  } catch (error) {
-    console.error("Generate error:", error.message);
-
-    res.status(500).json({
-      error: "Code generation failed."
-    });
-  }
-});
-
-app.post("/api/build", checkAuth, async (req, res) => {
-  try {
-    const body = getBody(req);
-    const prompt = clean(body.prompt, 12000);
-
-    if (!prompt) {
-      return res.status(400).json({
-        error: "A build prompt is required."
-      });
-    }
-
-    if (!moderate(prompt)) {
-      return res.status(400).json({
-        error: "This request cannot be processed."
-      });
-    }
-
-    const result = await runAgent(buildMap, {
-      prompt,
-      workspace: body.workspace || null,
-      context: clean(body.context, 12000)
-    });
-
-    res.json({
-      success: true,
-      result
-    });
-  } catch (error) {
-    console.error("Build error:", error.message);
-
-    res.status(500).json({
-      error: "Build request failed."
-    });
-  }
-});app.post("/api/improve", checkAuth, async (req, res) => {
-  try {
-    const body = getBody(req);
-    const prompt = clean(body.prompt, 12000);
-
-    if (!prompt) {
-      return res.status(400).json({
-        error: "An improvement prompt is required."
-      });
-    }
-
-    if (!moderate(prompt)) {
-      return res.status(400).json({
-        error: "This request cannot be processed."
-      });
-    }
-
-    const result = await runAgent(improveMap, {
-      prompt,
-      workspace: body.workspace || null,
-      context: clean(body.context, 12000)
-    });
-
-    res.json({
-      success: true,
-      result
-    });
-  } catch (error) {
-    console.error("Improve error:", error.message);
-
-    res.status(500).json({
-      error: "Improvement failed."
-    });
-  }
-});
-
-app.post("/api/undo", checkAuth, (req, res) => {
-  try {
-    const body = getBody(req);
-
-    if (!body.previousWorkspace) {
-      return res.status(400).json({
-        error: "Previous workspace data is required."
-      });
-    }
-
-    res.json({
-      success: true,
-      workspace: safeOutput(body.previousWorkspace)
-    });
-  } catch (error) {
-    console.error("Undo error:", error.message);
-
-    res.status(500).json({
-      error: "Undo failed."
-    });
-  }
-});
-
-app.post("/api/ideas", checkAuth, async (req, res) => {
-  try {
-    const body = getBody(req);
-
-    const result = await runAgent(generateIdeas, {
-      prompt: clean(body.prompt, 5000),
-      context: clean(body.context, 10000)
-    });
-
-    res.json({
-      success: true,
-      result
-    });
-  } catch (error) {
-    console.error("Ideas error:", error.message);
-
-    res.status(500).json({
-      error: "Idea generation failed."
-    });
-  }
-});
-
-app.post("/api/review", checkAuth, async (req, res) => {
-  try {
-    const body = getBody(req);
-
-    if (!body.workspace) {
-      return res.status(400).json({
-        error: "Workspace data is required."
-      });
-    }
-
-    const result = await runAgent(reviewWorkspace, {
-      workspace: body.workspace,
-      context: clean(body.context, 10000)
-    });
-
-    res.json({
-      success: true,
-      result
-    });
-  } catch (error) {
-    console.error("Review error:", error.message);
-
-    res.status(500).json({
-      error: "Workspace review failed."
-    });
-  }
-});
-
-app.use((req, res) => {
-  res.status(404).json({
-    error: "Not found",
-    path: req.path
-  });
-});
-
-app.use((error, req, res, next) => {
-  console.error("Server error:", error.message);
-
-  if (res.headersSent) {
-    return next(error);
-  }
-
-  res.status(500).json({
-    error: "Internal server error."
-  });
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("RobloxAI server running on port " + PORT);
-});
+};
