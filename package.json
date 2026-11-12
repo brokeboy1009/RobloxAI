@@ -1,16 +1,11 @@
 {
-  "name": "robloxai",
-  "version": "2.1.0",
-  "description": "RobloxAI game creation backend",
+  "name": "game-ai",
+  "version": "1.0.0",
   "main": "server.js",
-  "engines": {
-    "node": ">=18"
-  },
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "express-rate-limit": "^7.4.0"
+    "express": "^4.19.2"
   }
 }
