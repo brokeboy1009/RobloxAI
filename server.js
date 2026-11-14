@@ -751,8 +751,7 @@ app.post("/build", async (req, res) => {
     res.status(e.detail ? 502 : 500).json({ error: String(e.detail ? "ai busy" : e) });
   }
 });
-
-if require("./discord-setup")(app);
+require("./discord-setup")(app);
   app.listen(process.env.PORT || 3000);
 }
 
