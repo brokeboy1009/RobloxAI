@@ -752,7 +752,7 @@ app.post("/build", async (req, res) => {
   }
 });
 
-require("./discord-setup")(app);
+if require("./discord-setup")(app);
   app.listen(process.env.PORT || 3000);
 }
 
